@@ -1,17 +1,14 @@
 /*
 	VitaShell
 	Copyright (C) 2015-2017, TheFloW
-
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
 	the Free Software Foundation, either version 3 of the License, or
 	(at your option) any later version.
-
 	This program is distributed in the hope that it will be useful,
 	but WITHOUT ANY WARRANTY; without even the implied warranty of
 	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 	GNU General Public License for more details.
-
 	You should have received a copy of the GNU General Public License
 	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
@@ -20,6 +17,7 @@
 #include <psp2kern/kernel/modulemgr.h>
 #include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/io/fcntl.h>
+#include <psp2kern/kernel/threadmgr.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -62,14 +60,6 @@ static SceIoDevice uma_uma0_dev = { "ux0:", "exfatux0", "sdstor0:xmc-lp-ign-user
 static SceIoMountPoint *(* sceIoFindMountPoint)(int id) = NULL;
 
 static SceIoDevice *ori_dev = NULL, *ori_dev2 = NULL;
-
-static int exists(const char *path) {
-	int fd = ksceIoOpen(path, SCE_O_RDONLY, 0);
-	if (fd < 0)
-		return 0;
-	ksceIoClose(fd);
-	return 1;
-}
 
 static void io_remount(int id) {
 	ksceIoUmount(id, 0, 0, 0);
@@ -164,6 +154,7 @@ int redirect_ux0() {
 
 		case 0xA96ACE9D: // 3.65 retail
 		case 0x3347A95F: // 3.67 retail
+    case 0x90DA33DE: // 3.68 lmao
 			module_get_offset(KERNEL_PID, info.modid, 0, 0x182F5, (uintptr_t *)&sceIoFindMountPoint);
 			break;
 
@@ -202,37 +193,91 @@ int poke_gamecard() {
 	return 0;
 }
 
-int sysevent_handler(int resume, int eventid, void *args, void *opt) {
-	if (eventid != 0x100000)
-		return 0;
+tai_hook_ref_t hook_get_partition;
+tai_hook_ref_t hook_write;
+tai_hook_ref_t hook_mediaid;
 
-	poke_gamecard();
+uint32_t magic = 0x7FFFFFFF;
 
-	return 0;
+void *sdstor_mediaid;
+
+void *my_get_partition(const char *name, size_t len){
+  void *ret = TAI_CONTINUE(void*, hook_get_partition, name, len);
+  if (!ret && len == 18 && strcmp(name, "gcd-lp-act-mediaid") == 0) {
+    return &magic;
+  }
+  return ret;
 }
 
-int register_sysevent() {
-	ksceKernelRegisterSysEventHandler("gamesd", sysevent_handler, NULL);
+uint32_t my_write(uint8_t *dev, void *buf, uint32_t sector, uint32_t size) {
+  if (dev[36] == 1 && sector == magic) {
+    return 0;
+  }
+  return TAI_CONTINUE(uint32_t, hook_write, dev, buf, sector, size);
 }
 
-int gen_init_2_patch_uid;
+uint32_t my_mediaid(uint8_t *dev) {
+	uint32_t ret = TAI_CONTINUE(uint32_t, hook_mediaid, dev);
+	if (dev[36] == 1) {
+		memset(dev + 20, 0xFF, 16);
+		memset(sdstor_mediaid, 0xFF, 16);
+		return magic;
+	}
+	return ret;
+}
 
 // allow SD cards, patch by motoharu
 void patch_sdstor() {
 	tai_module_info_t sdstor_info;
 	sdstor_info.size = sizeof(tai_module_info_t);
-	if (taiGetModuleInfoForKernel(KERNEL_PID, "SceSdstor", &sdstor_info) >= 0) {
-		//patch for proc_initialize_generic_2 - so that sd card type is not ignored
-		char zeroCallOnePatch[4] = {0x01, 0x20, 0x00, 0xBF};
-		gen_init_2_patch_uid = taiInjectDataForKernel(KERNEL_PID, sdstor_info.modid, 0, 0x2498, zeroCallOnePatch, 4); //patch (BLX) to (MOVS R0, #1 ; NOP)
-	}
+	if (taiGetModuleInfoForKernel(KERNEL_PID, "SceSdstor", &sdstor_info) < 0)
+		return;
+
+	module_get_offset(KERNEL_PID, sdstor_info.modid, 1, 0x1720, (uintptr_t *) &sdstor_mediaid);
+
+	// patch for proc_initialize_generic_2 - so that sd card type is not ignored
+	char zeroCallOnePatch[4] = {0x01, 0x20, 0x00, 0xBF};
+	taiInjectDataForKernel(KERNEL_PID, sdstor_info.modid, 0, 0x2498, zeroCallOnePatch, 4); //patch (BLX) to (MOVS R0, #1 ; NOP)
+	taiInjectDataForKernel(KERNEL_PID, sdstor_info.modid, 0, 0x2940, zeroCallOnePatch, 4);
+
+	taiHookFunctionOffsetForKernel(KERNEL_PID, &hook_get_partition, sdstor_info.modid, 0, 0x142C, 1, my_get_partition);
+	taiHookFunctionOffsetForKernel(KERNEL_PID, &hook_write, sdstor_info.modid, 0, 0x2C58, 1, my_write);
+	taiHookFunctionOffsetForKernel(KERNEL_PID, &hook_mediaid, sdstor_info.modid, 0, 0x3D54, 1, my_mediaid);
+}
+
+void patch_appmgr() {
+  tai_module_info_t appmgr_info;
+  appmgr_info.size = sizeof(tai_module_info_t);
+  if (taiGetModuleInfoForKernel(KERNEL_PID, "SceAppMgr", &appmgr_info) >= 0) {
+    uint32_t nop_nop_opcode = 0xBF00BF00;
+    switch (appmgr_info.module_nid) {
+      case 0xDBB29DB7: // 3.60 retail
+      case 0x1C9879D6: // 3.65 retail
+        taiInjectDataForKernel(KERNEL_PID, appmgr_info.modid, 0, 0xB338, &nop_nop_opcode, 4);
+        taiInjectDataForKernel(KERNEL_PID, appmgr_info.modid, 0, 0xB368, &nop_nop_opcode, 2);
+        break;
+      case 0x54E2E984: // 3.67 retail
+      case 0xC3C538DE: // 3.68 retail
+        taiInjectDataForKernel(KERNEL_PID, appmgr_info.modid, 0, 0xB344, &nop_nop_opcode, 4);
+        taiInjectDataForKernel(KERNEL_PID, appmgr_info.modid, 0, 0xB374, &nop_nop_opcode, 2);
+        break;
+    }
+  }
+}
+
+static int exists(const char *path) {
+	int fd = ksceIoOpen(path, SCE_O_RDONLY, 0);
+	if (fd < 0)
+		return 0;
+	ksceIoClose(fd);
+	return 1;
 }
 
 void _start() __attribute__ ((weak, alias("module_start")));
 int module_start(SceSize args, void *argp) {
 	patch_sdstor();
+  patch_appmgr();
 	poke_gamecard();
-	register_sysevent();
 	if (exists("sdstor0:gcd-lp-ign-entire")) {
 		redirect_ux0();
 	}
