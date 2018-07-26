@@ -2,7 +2,7 @@
 
 ## Software
 
-`driver` contains a kernel module. Add it to taihen's `config.txt` KERNEL section. You can download a precompiled `.skprx` from the [Releases](https://github.com/Ninoh-FOX/gamecard-microsd-uma0/releases) section.
+`driver` contains a kernel module. Add it to taihen's `config.txt` KERNEL section. You can download a precompiled `.skprx` from the [Releases](https://github.com/JackWitherell/gamecard-microsd-uma0/releases) section.
 
 Your microSD card must have no partition table. exFAT filesystem should be written directly to the device. On Linux, do:
 
